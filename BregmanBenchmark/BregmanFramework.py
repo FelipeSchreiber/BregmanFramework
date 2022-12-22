@@ -101,16 +101,23 @@ class BregmanClustering:
 				return torch.linalg.matrix_norm(K,ord=self.norm,keepdim=False)
 			return obj_func
 		
-	def make_obj_func_hard(self,phi_net,phi_data,A,X,N,c,dim):	
+	def make_obj_func_hard(self,phi_net,phi_data,A,X,W_0,B_0,mu_0):	
+		#Z = W_0/W_0.sum(dim=0)
+		#net_div0 = torch.multiply(W_0, self.pairwise_bregman(A@Z,Z.T@A@Z, phi_data)).sum()
+		#net_div = phi_net(A,W_0@B_0@W_0.T)
+		#net_divergence = torch.sum(net_div,axis=1) + torch.sum(net_div,axis=0)
+		#net_div0 = net_divergence.sum()
+		#data_div0 = torch.multiply(W_0, self.pairwise_bregman(X, mu_0, phi_data)).sum()
+		data_div0 = net_div0 = 1
 		def obj_func(W,B,mu):
-			#net_div = phi_net(A,W@B@W.T)
-			#net_divergence = torch.sum(net_div,axis=1) + torch.sum(net_div,axis=0)
-			Z = W/W.sum(dim=0)
-			net_divergence = torch.sum(torch.multiply(W, self.pairwise_bregman(A@Z,Z.T@A@Z, phi_data)),axis=1)
-			data_divergence = torch.sum(torch.multiply(W, self.pairwise_bregman(X, mu, phi_data)),axis=1)
+			net_div = phi_net(A,W@B@W.T)
+			net_divergence = (torch.sum(net_div,axis=1) + torch.sum(net_div,axis=0))/net_div0
+			#Z = W/W.sum(dim=0)
+			#net_divergence = torch.sum(torch.multiply(W, self.pairwise_bregman(A@Z,Z.T@A@Z, phi_data)),axis=1)/net_div0
+			data_divergence = torch.sum(torch.multiply(W, self.pairwise_bregman(X, mu, phi_data)),axis=1)/data_div0
+			#print("net ",net_divergence.sum(),"div ",data_divergence.sum())
 			K = torch.stack((net_divergence,data_divergence),axis=-1)
 			return K.sum()
-			#return torch.min(K,dim=1).values.sum()
 		return obj_func
 		
 	#sum of W matrix row wise is one 
@@ -177,8 +184,7 @@ class BregmanClustering:
 		mu = res.x[N*c+c*c:].reshape((c, dim)).detach().numpy()
 		return W,B,mu
 		
-	def hard(self,obj_func,A,X,N,c,dim,threshold,phi_data):
-		_,W,B,mu = self.init_variables(A,X,N,c,dim)
+	def hard(self,obj_func,A,X,N,c,dim,threshold,W,B,mu):
 		classes_old = classes = None
 		convergence_cnt = 0
 		convergence_threshold = threshold
@@ -212,10 +218,6 @@ class BregmanClustering:
 				convergence_cnt = 0
 			if convergence_cnt == convergence_threshold:
 				print("point assignments have converged")
-				Z = W/W.sum(dim=0)
-				net_divergence = torch.sum(torch.multiply(W, self.pairwise_bregman(A@Z,Z.T@A@Z, phi_data)),axis=1)
-				data_divergence = torch.sum(torch.multiply(W, self.pairwise_bregman(X, mu, phi_data)),axis=1)
-				print("net_div",net_divergence.sum(),"data_div",data_divergence.sum())
 				break
 		return W.detach().numpy(),B.detach().numpy(),mu.detach().numpy()
 		
@@ -228,5 +230,6 @@ class BregmanClustering:
 			obj_func = self.make_obj_func_kmeans(phi_net,phi_data,A,X,N,c,dim)
 			return self.kmeans(obj_func,phi_net,phi_data,A,X,N,c,dim,maxiter,threshold)
 		else:
-			obj_func = self.make_obj_func_hard(phi_net,phi_data,A,X,N,c,dim)
-			return self.hard(obj_func,A,X,N,c,dim,threshold,phi_data)
+			_,W,B,mu = self.init_variables(A,X,N,c,dim)
+			obj_func = self.make_obj_func_hard(phi_net,phi_data,A,X,W,B,mu)
+			return self.hard(obj_func,A,X,N,c,dim,threshold,W,B,mu)
