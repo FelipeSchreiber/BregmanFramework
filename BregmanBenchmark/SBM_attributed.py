@@ -67,7 +67,7 @@ def generate_benchmark(P_net,K,delta,n,dim=2,sample_along_direction=True,P_data=
 		G.nodes[i]["attr"] = X[i,:]
 	return G,nx.to_numpy_array(G),X
 	
-def generate_benchmark_unit_circle(P,K,sigma,n,dim):
+def generate_benchmark_unit_circle(P,K,sigma,n,dim,delta):
 	basis = []
 	for i in range(K):
 		basis.append((np.cos(2*np.pi*i/K),np.sin(2*np.pi*i/K)))
@@ -76,4 +76,4 @@ def generate_benchmark_unit_circle(P,K,sigma,n,dim):
 		for i in range(n):## PARA CADA VÉRTICE DE UMA COMUNIDADE
 			X[i+n*c][:] = np.random.multivariate_normal(basis[c],np.diag([sigma]*2))
 	G = nx.stochastic_block_model([n]*K,P,seed=42)
-	return G,nx.to_numpy_array(G),X	
+	return G,nx.to_numpy_array(G),X*delta	
