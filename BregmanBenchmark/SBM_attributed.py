@@ -47,7 +47,6 @@ def make_vectors(P,K,delta,n,dim=2,sample_along_direction=True):
     	#diff = np.amin(np.amin(P[P != np.amin(P,axis=0)].reshape(K,K-1),axis=1) - np.amin(P,axis=0))
     	diff = np.amin(dist)
     	delta = 2*1.1*np.sqrt( ( 1 + np.sqrt( 1+2*K/( N*np.log(N) ) ) )*np.log(N) )/(diff*np.sqrt(dim))
-    	print("Delta=\n",delta)
     basis = make_basis(P,K,delta,dim,sample_along_direction)
     for c in range(K): ## PARA CADA UMA DAS COMUNIDADES
         for i in range(n):## PARA CADA VÉRTICE DE UMA COMUNIDADE
@@ -70,10 +69,12 @@ def generate_benchmark(P_net,K,delta,n,dim=2,sample_along_direction=True,P_data=
 def generate_benchmark_unit_circle(P,K,sigma,n,dim,delta):
 	basis = []
 	for i in range(K):
-		basis.append((np.cos(2*np.pi*i/K),np.sin(2*np.pi*i/K)))
+		basis.append((delta*np.cos(2*np.pi*i/K),delta*np.sin(2*np.pi*i/K)))
 	X = np.zeros((K*n,2))
 	for c in range(K): ## PARA CADA UMA DAS COMUNIDADES
 		for i in range(n):## PARA CADA VÉRTICE DE UMA COMUNIDADE
 			X[i+n*c][:] = np.random.multivariate_normal(basis[c],np.diag([sigma]*2))
 	G = nx.stochastic_block_model([n]*K,P,seed=42)
-	return G,nx.to_numpy_array(G),X*delta	
+	for i in range(n*K):
+		G.nodes[i]["attr"] = X[i,:]
+	return G,nx.to_numpy_array(G),X	

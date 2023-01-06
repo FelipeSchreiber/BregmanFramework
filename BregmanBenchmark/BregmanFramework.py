@@ -6,6 +6,10 @@ from torchmin import minimize_constr
 from sklearn.cluster import KMeans
 from scipy.sparse import csgraph
 from scipy.sparse.linalg import eigs
+from torch.distributions.categorical import Categorical
+from bregman_kmeans import *
+from scipy.stats import entropy
+from scipy.optimize import linear_sum_assignment
 
 def euclidean(x,y): return torch.clamp(torch.pow(x-y,2), min=1e-12, max=1e6)
 def kl_div(x,y): return torch.clamp(x*torch.log(x/y), min=1e-12, max=1e6)
@@ -15,33 +19,40 @@ def gamma(x,y,k): return torch.clamp(k * torch.log(y/x) + x - y, min=1e-12, max=
 
 class BregmanClustering:
 	def __init__(self,norm=-1,matrix_norm=False,method='kmeans',
-			divergence_method = 'elementwise',
+			data_divergence_method = 'elementwise',
+			net_divergence_method = 'elementwise',
 			net_divergence="euclidean",data_divergence="euclidean",
 			initialization='random'):
 		self.norm = norm
 		self.matrix_norm = matrix_norm
 		self.method = method
-		self.divergence_method = divergence_method
-		if method == "soft":
-			self.divergence_method = 'Nelementwise'
-		if self.divergence_method == 'elementwise': ## As in "Graph Partitioning Based on Link Distributions"
+		self.data_divergence_name = data_divergence
+		self.net_divergence_name = net_divergence
+		self.data_divergence_method = data_divergence_method
+		self.net_divergence_method = net_divergence_method
+		
+		if method == "soft" or method == 'two_phase':
+			self.net_divergence_method = 'Nelementwise'
+			self.data_divergence_method = 'Nelementwise'
+		if self.data_divergence_method == 'elementwise': ## As in "Graph Partitioning Based on Link Distributions"
 			self.phi_data = self.get_divergence_elementwise(net_divergence)
 			def data_div(X,W,mu):
 				return torch.sum(self.phi_data(X,W@mu),axis=1)
 			self.data_divergence = data_div
-			
-			self.phi_net = self.get_divergence_elementwise(net_divergence)				
-			def net_div(A,W,B): 
-				net_div = self.phi_net(A,W@B@W.T) 
-				return torch.sum(net_div,axis=1) + torch.sum(net_div,axis=0) - torch.diag(net_div)
-			self.net_divergence = net_div 
-				
-		else:	## As in "An iterative clustering algorithm for the Contextual Stochastic Block Model with optimality guarantees"
+		
+		else:## As in "An iterative clustering algorithm for the Contextual Stochastic Block Model with optimality guarantees"
 			self.phi_data = self.get_phi(data_divergence)
 			def data_div(X,W,mu):
 				return torch.sum(torch.multiply(W, self.pairwise_bregman(X, mu, self.phi_data)),axis=1)
 			self.data_divergence = data_div 
-			
+		
+		if self.net_divergence_method == 'elementwise':
+			self.phi_net = self.get_divergence_elementwise(net_divergence)				
+			def net_div(A,W,B): 
+				net_div = self.phi_net(A,W@B@W.T) 
+				return torch.sum(net_div,axis=1) + torch.sum(net_div,axis=0)
+			self.net_divergence = net_div 	
+		else:
 			self.phi_net = self.get_phi(net_divergence)				
 			def net_div(A,W,B): 
 				Z = W/W.sum(dim=0)
@@ -117,14 +128,18 @@ class BregmanClustering:
 		mu = WW_inv@W.T@X
 		x_0 = torch.hstack([W.flatten(),B.flatten(),mu.flatten()])
 		return x_0,W,B,mu
-	
-	def init_variables_spectral(self,A,X,N,c,dim):
+
+	def get_spectral_decomposition(self,A,c):
 		L = csgraph.laplacian(A)
 		L = L.astype(np.float32)
 		vals = vecs = 0
 		vals, vecs = eigs(L, k=(c+1), which='SM', maxiter=5000)
 		U = np.delete(vecs,np.argmin(vals),1)
-		W = torch.nn.functional.one_hot( torch.tensor(KMeans(n_clusters=c).fit_predict(U.real),dtype=int) ).float()
+		return U.real
+
+	def init_variables_spectral(self,A,X,N,c,dim):
+		U = self.get_spectral_decomposition(A,c)
+		W = torch.nn.functional.one_hot( torch.tensor(KMeans(n_clusters=c).fit_predict(U),dtype=int) ).float()
 		A = torch.tensor(A, dtype=torch.float32)
 		X = torch.tensor(X, dtype=torch.float32)
 		WW_inv = torch.inverse(W.T@W)
@@ -232,22 +247,19 @@ class BregmanClustering:
 		B = res.x[N*c:N*c+c*c].reshape((c, c))
 		mu = res.x[N*c+c*c:].reshape((c, dim))
 		return W,B,mu
-		
+
 	def hard(self,obj_func,A,X,N,c,dim,maxiter,threshold,W,B,mu):
 		classes_old = classes = None
 		convergence_cnt = 0
 		convergence_threshold = threshold
 		iter = 0
 		failed_to_converge = False
-		Z = W/W.sum(dim=0)
-		Pi = Z.T@A@Z
-		C = A@Z
-		net_div0 = self.pairwise_bregman(C, Pi, self.phi_net).sum()
-		data_div0 = self.pairwise_bregman(X, mu, self.phi_data).sum()
+		net_div0 = self.net_divergence(A,W,B).sum()
+		data_div0 = self.data_divergence(X,W,mu).sum()
 		while True:
 			iter += 1
 			print(iter)
-			if self.divergence_method == 'elementwise':
+			if self.data_divergence_method == 'elementwise' or self.net_divergence_method == 'elementwise':
 				for i in range(N):
 					W[i,:] = 0
 					min_ = torch.tensor(np.inf)
@@ -269,9 +281,8 @@ class BregmanClustering:
 				C = A@Z
 				data_div = self.pairwise_bregman(X, mu, self.phi_data)
 				net_div = self.pairwise_bregman(C, Pi, self.phi_net)
-				#indices = torch.argmin(net_div/net_div.sum(dim=1).reshape(-1,1).expand(-1,c)+data_div/data_div.sum(dim=1).reshape(-1,1).expand(-1,c),dim=1)
-				indices = torch.argmin(net_div/net_div0+data_div/data_div0,dim=1)
-				#indices = torch.argmin(net_div+data_div,dim=1)
+				indices = torch.argmin(net_div/net_div.sum(dim=1).reshape(-1,1).expand(-1,c)+data_div/data_div.sum(dim=1).reshape(-1,1).expand(-1,c),dim=1)
+				#indices = torch.argmin(net_div/net_div0+data_div/data_div0,dim=1)
 				W = torch.nn.functional.one_hot(indices).float()
 			WW_inv = torch.pinverse(W.T@W)
 			B = WW_inv@W.T@A@W@WW_inv
@@ -289,7 +300,7 @@ class BregmanClustering:
 				print("point assignments have converged")
 				break
 		return W,B,mu
-	
+
 	def soft(self,obj_func,A,X,N,c,dim,maxiter,threshold,W,B,mu):
 		classes_old = classes = None
 		convergence_cnt = 0
@@ -297,24 +308,29 @@ class BregmanClustering:
 		iter = 0
 		failed_to_converge = False
 		Z = W/W.sum(dim=0)
-		Pi = Z.T@A@Z
+		B = Z.T@A@Z
 		C = A@Z
-		net_div0 = self.pairwise_bregman(C, Pi, self.phi_net).sum(dim=1).reshape(-1,1).expand(-1,c)
-		data_div0 = self.pairwise_bregman(X, mu, self.phi_data).sum(dim=1).reshape(-1,1).expand(-1,c)
+		communities_priors = torch.ones(c)/c
 		while True:
 			iter += 1
-			print(iter)
-			Z = W/W.sum(dim=0)
-			Pi = Z.T@A@Z
-			C = A@Z
 			data_div = self.pairwise_bregman(X, mu, self.phi_data)
-			net_div = self.pairwise_bregman(C, Pi, self.phi_net)
-			#K = torch.exp(-net_div/net_div.sum(dim=1).reshape(-1,1).expand(-1,c) -data_div/data_div.sum(dim=1).reshape(-1,1).expand(-1,c))
-			K = torch.exp(-net_div/net_div0-data_div/data_div0)
-			W = K/K.sum(dim=1).reshape(-1,1).expand(-1,c)
-			WW_inv = torch.pinverse(W.T@W)
-			B = WW_inv@W.T@A@W@WW_inv
-			mu = WW_inv@W.T@X
+			net_div = self.pairwise_bregman(C, B, self.phi_net)
+			print(net_div[0,:],data_div[0,:])
+			net_probs = torch.exp(-net_div)
+			net_probs /= net_probs.sum(dim=1).reshape(-1,1).expand(-1,c) 
+			data_probs = torch.exp(-data_div)
+			data_probs /= data_probs.sum(dim=1).reshape(-1,1).expand(-1,c) 
+			K = data_probs*net_probs
+			K *= communities_priors 
+			soft_assignments = K/K.sum(dim=1).reshape(-1,1).expand(-1,c)
+			indices = torch.argmax(soft_assignments,dim=1)
+			W = torch.nn.functional.one_hot(indices).float()
+			Z = W/W.sum(dim=0)
+			B = Z.T@A@Z
+			C = A@Z
+			mu = (soft_assignments.T@X)/soft_assignments.sum(dim=0).reshape(-1,1).expand(-1,mu.shape[1])
+
+			#communities_priors = torch.mean(W,dim=0)
 			#update values
 			if classes is not None:
 				classes_old = classes
@@ -335,19 +351,30 @@ class BregmanClustering:
 		x_0,W,B,mu = self.init_variables(A,X,N,c,dim)
 		A = torch.tensor(A,dtype=torch.float32)
 		X = torch.tensor(X,dtype=torch.float32)
+		
 		if self.method == 'kmeans':
 			obj_func = self.make_obj_func_kmeans(A,X,N,c,dim)
 			W,B,mu = self.kmeans(obj_func,A,X,N,c,dim,maxiter,threshold,annealing,x_0)
 			return W.detach().numpy(),B.detach().numpy(),mu.detach().numpy()
+		
 		elif self.method == 'hard':
 			obj_func = self.make_obj_func_hard(A,X)
 			print("net_div = ",self.net_divergence(A,W,B).sum(),"data_div = ",self.data_divergence(X,W,mu).sum())
 			W,B,mu = self.hard(obj_func,A,X,N,c,dim,maxiter,threshold,W,B,mu)
 			print("net_div = ",self.net_divergence(A,W,B).sum(),"data_div = ",self.data_divergence(X,W,mu).sum())
 			return W.detach().numpy(),B.detach().numpy(),mu.detach().numpy()
-		else:
+		
+		elif self.method == 'soft':
 			obj_func = self.make_obj_func_soft(A,X)
 			print("net_div = ",self.net_divergence(A,W,B).sum(),"data_div = ",self.data_divergence(X,W,mu).sum())
 			W,B,mu = self.soft(obj_func,A,X,N,c,dim,maxiter,threshold,W,B,mu)
 			print("net_div = ",self.net_divergence(A,W,B).sum(),"data_div = ",self.data_divergence(X,W,mu).sum())
 			return W.detach().numpy(),B.detach().numpy(),mu.detach().numpy()
+	
+		elif self.method == "two_phase":
+			obj_func = self.make_obj_func_soft(A,X)
+			#print("net_div = ",self.net_divergence(A,W,B).sum(),"data_div = ",self.data_divergence(X,W,mu).sum())
+			W,B,mu = self.two_phase(obj_func,A,X,N,c,dim,maxiter,threshold,W,B,mu)
+			#print("net_div = ",self.net_divergence(A,W,B).sum(),"data_div = ",self.data_divergence(X,W,mu).sum())
+			return W.detach().numpy(),B.detach().numpy(),mu.detach().numpy()						
+
